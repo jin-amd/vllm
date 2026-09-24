@@ -245,7 +245,7 @@ def sparse_attn_indexer_kpool(
         # The indexer projections and K cache are replicated across TP ranks,
         # so long prefills otherwise recompute the same MQA logits and top-k on
         # every rank. Each query row is independent: score one contiguous shard
-        # per rank and exchange only the final token indices. KV gathers stay
+        # per rank and exchange only the selected indices. KV gathers stay
         # unconditional because continuation query chunks reuse their cache.
         shard_sizes = getattr(prefill_metadata, "row_shard_sizes", None)
         shard_start = shard_stop = 0
@@ -294,6 +294,20 @@ def sparse_attn_indexer_kpool(
             # Short prefills skip MQA scoring entirely, so there is no local
             # row-sharded result to exchange.
             shard_sizes = None
+
+        # With k-pooling, exchange the selected pool ids rather than their token
+        # expansion: topk_tokens // index_kpool entries per row instead of
+        # topk_tokens + index_kpool - 1. Expansion is a per-row map, so
+        # expanding the gathered rows on every rank yields the same indices.
+        # Rows a chunk never scores keep -1 pools and expand to their tail.
+        local_pools = None
+        if shard_sizes is not None and index_kpool > 1 and positions is not None:
+            local_pools = torch.full(
+                (shard_stop - shard_start, topk_tokens // index_kpool),
+                -1,
+                dtype=torch.int32,
+                device=topk_indices_buffer.device,
+            )
 
         # Get the full shared workspace buffers once (will allocate on first use).
         # Layout switches between FP8 (head_dim bytes + 4-byte fp32 scale) and
@@ -369,7 +383,10 @@ def sparse_attn_indexer_kpool(
             # so topk selects pools. We pick topk_tokens // kpool pools then
             # expand each pool back to its kpool constituent tokens.
             select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
-            if index_kpool > 1:
+            if local_pools is not None:
+                pool_topk = local_pools[row_start - shard_start : row_end - shard_start]
+                topk_dst = pool_topk
+            elif index_kpool > 1:
                 pool_topk = torch.empty(
                     (num_rows, select_k), dtype=torch.int32, device=logits.device
                 )
@@ -388,6 +405,8 @@ def sparse_attn_indexer_kpool(
                 select_k,
             )
 
+            if local_pools is not None:
+                continue
             if index_kpool > 1:
                 pool_ids = pool_topk.to(torch.int64)
                 if positions is not None:
@@ -405,7 +424,20 @@ def sparse_attn_indexer_kpool(
                     )
                 topk_indices_buffer[row_start:row_end, : expanded.shape[-1]] = expanded
 
-        if shard_sizes is not None:
+        if local_pools is not None:
+            assert positions is not None
+            prefill_end = num_decode_tokens + sum(shard_sizes)
+            gathered_pools = get_tp_group().all_gatherv(
+                local_pools, dim=0, sizes=shard_sizes
+            )
+            q_seq = positions[num_decode_tokens:prefill_end].to(torch.int32) + 1
+            expanded = kpool_ops.expand_pools_and_append_tail(
+                gathered_pools.to(torch.int64), q_seq, index_kpool
+            )
+            topk_indices_buffer[num_decode_tokens:prefill_end, : expanded.shape[-1]] = (
+                expanded
+            )
+        elif shard_sizes is not None:
             # Metadata token counts can include graph padding, unlike the shard.
             prefill_end = num_decode_tokens + sum(shard_sizes)
             # K-pool expansion appends the request's incomplete tail after the
